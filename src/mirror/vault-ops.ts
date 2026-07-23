@@ -135,4 +135,10 @@ export class ObsidianVaultOps implements VaultOps {
     const f = this.vault.getAbstractFileByPath(normalizePath(path));
     return f instanceof TFolder && f.children.length === 0;
   }
+
+  listChildren(path: string): { name: string; isFolder: boolean }[] {
+    const folder = path === '' ? this.vault.getRoot() : this.vault.getAbstractFileByPath(normalizePath(path));
+    if (!(folder instanceof TFolder)) return [];
+    return folder.children.map((c) => ({ name: c.name, isFolder: c instanceof TFolder }));
+  }
 }

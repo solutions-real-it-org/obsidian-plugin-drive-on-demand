@@ -52,7 +52,12 @@ export default class GoogleDriveFodPlugin extends Plugin {
     const vaultOps = new ObsidianVaultOps(this.app.vault, (p) => pluginCreated.add(p));
     this.hydrator = new Hydrator(vaultOps, this.index, this.drive);
 
-    const model = new DriveTreeModel(this.drive, keyedAdapter(this.data, 'treeCache'));
+    const model = new DriveTreeModel(
+      this.drive,
+      keyedAdapter(this.data, 'treeCache'),
+      undefined,
+      (p) => vaultOps.listChildren(p), // fichiers locaux absents de Drive → affichés grisés
+    );
     await model.load();
 
     const syncState = new SelectiveSyncState(keyedAdapter(this.data, 'sync'));
@@ -149,7 +154,7 @@ export default class GoogleDriveFodPlugin extends Plugin {
       );
     });
 
-    this.registerView(VIEW_TYPE, (leaf) => new DriveTreeView(leaf, model, syncState, engine, this.drive, workingRoot));
+    this.registerView(VIEW_TYPE, (leaf) => new DriveTreeView(leaf, model, syncState, engine, this.drive, workingRoot, create));
     this.addRibbonIcon('cloud', t('ribbon.googleDrive'), () => void this.activateDriveView());
     this.addCommand({
       id: 'gdrive-fod-open-panel',

@@ -13,7 +13,7 @@ function driveObj() {
   return new DriveClient(http, async () => 'AT');
 }
 function vaultObj(local = 'contenu') {
-  const vault: VaultOps = { exists: async () => true, createFolder: async () => {}, createStub: async () => {}, writeText: async () => {}, writeBinary: async () => {}, readText: async () => local, readBinary: async () => new ArrayBuffer(0), remove: async () => {}, isEmptyFolder: () => false };
+  const vault: VaultOps = { exists: async () => true, createFolder: async () => {}, createStub: async () => {}, writeText: async () => {}, writeBinary: async () => {}, readText: async () => local, readBinary: async () => new ArrayBuffer(0), remove: async () => {}, isEmptyFolder: () => false, listChildren: () => [] };
   return vault;
 }
 const folderEntry = (driveId: string): MirrorEntry => ({ driveId, mimeType: 'application/vnd.google-apps.folder', isFolder: true, hydrated: true, pinned: true });
@@ -170,5 +170,37 @@ describe('CreateManager.handleCreate', () => {
     expect(move).not.toHaveBeenCalled();
     expect(index.get('dir/note.md')).toBeUndefined(); // plus suivi
     expect(state.isSynced('dir/note.md')).toBe(false);
+  });
+
+  // ── Téléversement d'un fichier « local-only » (uploadLocal) ──
+
+  it('uploadLocal pousse un fichier local sous un parent Drive fourni, sans ancêtre suivi', async () => {
+    const index = new MirrorIndex(ad()); await index.load();
+    const state = new SelectiveSyncState(ad()); await state.load();
+    const drive = driveObj();
+    vi.spyOn(drive, 'children').mockResolvedValue([]);
+    vi.spyOn(drive, 'createFile').mockResolvedValue({ id: 'UP', headRevisionId: 'r1' });
+    const cm = new CreateManager({ index, drive, vault: vaultObj('# contenu'), state });
+    expect(await cm.uploadLocal('note.md', false, 'PARENT_ID')).toBe('created');
+    expect(drive.createFile).toHaveBeenCalledWith('PARENT_ID', 'note.md', '# contenu');
+    expect(index.get('note.md')?.driveId).toBe('UP');
+    expect(state.fileState('note.md')).toBe('checked');
+  });
+
+  it('uploadLocal d un dossier téléverse récursivement son contenu local', async () => {
+    const index = new MirrorIndex(ad()); await index.load();
+    const state = new SelectiveSyncState(ad()); await state.load();
+    const drive = driveObj();
+    vi.spyOn(drive, 'children').mockResolvedValue([]);
+    vi.spyOn(drive, 'createDriveFolder').mockResolvedValue({ id: 'FOLDER_DRIVE' });
+    vi.spyOn(drive, 'createFile').mockResolvedValue({ id: 'F', headRevisionId: 'r1' });
+    const vault = vaultObj('# c');
+    vi.spyOn(vault, 'listChildren').mockImplementation((p) => (p === 'dossier' ? [{ name: 'enfant.md', isFolder: false }] : []));
+    const cm = new CreateManager({ index, drive, vault, state });
+    expect(await cm.uploadLocal('dossier', true, 'PARENT')).toBe('created');
+    expect(drive.createDriveFolder).toHaveBeenCalledWith('PARENT', 'dossier');
+    expect(drive.createFile).toHaveBeenCalledWith('FOLDER_DRIVE', 'enfant.md', '# c');
+    expect(index.get('dossier')?.driveId).toBe('FOLDER_DRIVE');
+    expect(index.get('dossier/enfant.md')?.driveId).toBe('F');
   });
 });

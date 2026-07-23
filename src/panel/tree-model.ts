@@ -7,7 +7,16 @@ export interface TreeNode {
   name: string;
   path: string;
   isFolder: boolean;
-  meta: DriveMeta;
+  /** Présent uniquement pour les nœuds venant de Drive ; absent pour les nœuds « local-only ». */
+  meta?: DriveMeta;
+  /** Vrai si le fichier/dossier existe en LOCAL mais pas (encore) sur Drive — affiché grisé,
+   *  case = « téléverser ». Ces nœuds ont un id synthétique `local:<path>` et pas de meta. */
+  localOnly?: boolean;
+}
+
+const LOCAL_ID_PREFIX = 'local:';
+export function isLocalId(id: string): boolean {
+  return id.startsWith(LOCAL_ID_PREFIX);
 }
 
 /** Modèle de l'arbre Drive avec cache PERSISTANT (survit au redémarrage) et repli
@@ -24,6 +33,9 @@ export class DriveTreeModel {
     private drive: DriveClient,
     private adapter?: PersistAdapter,
     private onStatus?: (offline: boolean) => void,
+    /** Liste les enfants LOCAUX d'un dossier du vault — pour afficher les fichiers
+     *  présents en local mais absents de Drive (« local-only », grisés). */
+    private listLocal?: (path: string) => { name: string; isFolder: boolean }[],
   ) {}
 
   /** Recharge le cache persisté (au démarrage). Sans adapter : no-op. */
@@ -59,30 +71,37 @@ export class DriveTreeModel {
   }
 
   async loadChildren(folderId: string, parentPath: string): Promise<TreeNode[]> {
+    // Dossier « local-only » (pas sur Drive) : aucun appel Drive, uniquement le contenu local.
+    if (isLocalId(folderId)) {
+      return this.sortNodes(this.localOnlyNodes(parentPath, new Set()));
+    }
+    let metas: DriveMeta[];
     const cached = this.cache.get(folderId);
     const needFetch = !cached || this.stale.has(folderId);
     if (needFetch) {
       try {
-        const metas = await this.drive.children(folderId);
+        metas = await this.drive.children(folderId);
         this.cache.set(folderId, metas);
         this.stale.delete(folderId);
         this.setOffline(false);
         await this.persist();
-        return this.buildNodes(metas, parentPath);
       } catch (e) {
         // Un problème d'AUTH (non connecté) n'est PAS du hors-ligne : on le laisse remonter.
         if (String(e).includes('NEED_INTERACTIVE_AUTH')) throw e;
         // Réseau/Drive injoignable : repli sur le cache si on en a un, sinon on remonte l'erreur.
         this.setOffline(true);
-        if (cached) return this.buildNodes(cached, parentPath);
-        throw e;
+        if (!cached) throw e;
+        metas = cached;
       }
+    } else {
+      metas = cached as DriveMeta[];
     }
-    return this.buildNodes(cached as DriveMeta[], parentPath);
+    return this.mergeWithLocal(metas, parentPath);
   }
 
-  private buildNodes(metas: DriveMeta[], parentPath: string): TreeNode[] {
-    return metas
+  /** Fusionne les nœuds Drive avec les fichiers LOCAUX absents de Drive (grisés). */
+  private mergeWithLocal(metas: DriveMeta[], parentPath: string): TreeNode[] {
+    const driveNodes: TreeNode[] = metas
       .map((m) => ({
         id: m.id,
         name: m.name,
@@ -90,11 +109,27 @@ export class DriveTreeModel {
         isFolder: isFolder(m.mimeType),
         meta: m,
       }))
-      .filter((n) => !isIgnored(n.path))
-      .sort((a, b) => {
-        if (a.isFolder !== b.isFolder) return a.isFolder ? -1 : 1;
-        return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
-      });
+      .filter((n) => !isIgnored(n.path));
+    const driveNames = new Set(driveNodes.map((n) => n.name));
+    return this.sortNodes([...driveNodes, ...this.localOnlyNodes(parentPath, driveNames)]);
+  }
+
+  private localOnlyNodes(parentPath: string, exclude: Set<string>): TreeNode[] {
+    if (!this.listLocal) return [];
+    return this.listLocal(parentPath)
+      .filter((c) => !exclude.has(c.name))
+      .map((c) => {
+        const path = parentPath ? `${parentPath}/${c.name}` : c.name;
+        return { id: `${LOCAL_ID_PREFIX}${path}`, name: c.name, path, isFolder: c.isFolder, localOnly: true };
+      })
+      .filter((n) => !isIgnored(n.path));
+  }
+
+  private sortNodes(nodes: TreeNode[]): TreeNode[] {
+    return nodes.sort((a, b) => {
+      if (a.isFolder !== b.isFolder) return a.isFolder ? -1 : 1;
+      return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+    });
   }
 
   isExpanded(path: string): boolean {

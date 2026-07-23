@@ -2,6 +2,7 @@
 import { ItemView, WorkspaceLeaf, Notice, setIcon } from 'obsidian';
 import { DriveTreeModel, type TreeNode } from './tree-model';
 import type { SelectiveSyncState } from './selective-sync-state';
+import type { CreateManager } from './create-manager';
 import { SyncEngine } from './sync-engine';
 import { DriveClient, isGoogleNative } from '../drive/drive-client';
 import { CancelToken, isCancelledError } from '../util/cancel-token';
@@ -35,6 +36,7 @@ export class DriveTreeView extends ItemView {
     private engine: SyncEngine,
     private drive: DriveClient,
     private workingRoot: WorkingRootStore,
+    private create: CreateManager,
   ) {
     super(leaf);
   }
@@ -179,8 +181,9 @@ export class DriveTreeView extends ItemView {
   private async render(): Promise<void> {
     this.treeEl.empty();
     try {
-      const rootNodes = await this.model.loadChildren(this.workingRoot.rootId(), '');
-      for (const n of rootNodes) await this.renderNode(n, 0);
+      const rootId = this.workingRoot.rootId();
+      const rootNodes = await this.model.loadChildren(rootId, '');
+      for (const n of rootNodes) await this.renderNode(n, 0, rootId);
     } catch (e) {
       if (String(e).includes('NEED_INTERACTIVE_AUTH')) {
         this.treeEl.createEl('div', { text: t('panel.notConnected') });
@@ -204,7 +207,7 @@ export class DriveTreeView extends ItemView {
   /** Chemin local réellement suivi par le state/index pour ce nœud — les fichiers Google
    *  natifs (Docs/Sheets/Slides) sont matérialisés sous `<path>.md` (voir SyncEngine). */
   private effectivePath(node: TreeNode): string {
-    return !node.isFolder && isGoogleNative(node.meta.mimeType)
+    return !node.isFolder && node.meta && isGoogleNative(node.meta.mimeType)
       ? SyncEngine.googleNativeLocalPath(node.path)
       : node.path;
   }
@@ -222,7 +225,11 @@ export class DriveTreeView extends ItemView {
     return undefined;
   }
 
-  private async renderNode(node: TreeNode, depth: number): Promise<void> {
+  /** `parentDriveId` = id Drive RÉEL du dossier parent (pour téléverser un enfant local-only),
+   *  ou null si le parent est lui-même local-only (pas encore sur Drive). */
+  private async renderNode(node: TreeNode, depth: number, parentDriveId: string | null): Promise<void> {
+    if (node.localOnly) return this.renderLocalOnlyNode(node, depth, parentDriveId);
+
     const row = this.treeEl.createDiv({ cls: 'gdrive-fod-row' });
     row.style.paddingLeft = `${depth * 16}px`;
     row.style.cursor = 'pointer';
@@ -288,7 +295,55 @@ export class DriveTreeView extends ItemView {
       };
       if (this.model.isExpanded(node.path)) {
         const children = await this.model.loadChildren(node.id, node.path);
-        for (const c of children) await this.renderNode(c, depth + 1);
+        for (const c of children) await this.renderNode(c, depth + 1, node.id); // parent Drive réel
+      }
+    }
+  }
+
+  /** Nœud « local-only » : existe en local, pas sur Drive → grisé, case = téléverser (↑).
+   *  Téléversable seulement si le parent est un vrai dossier Drive (parentDriveId non null). */
+  private async renderLocalOnlyNode(node: TreeNode, depth: number, parentDriveId: string | null): Promise<void> {
+    const row = this.treeEl.createDiv({ cls: 'gdrive-fod-row gdrive-fod-local' });
+    row.style.paddingLeft = `${depth * 16}px`;
+    row.style.cursor = 'pointer';
+
+    if (this.syncingAncestor(node.path)) {
+      row.createSpan({ cls: 'gdrive-fod-spinner' });
+    } else if (parentDriveId) {
+      const cb = row.createSpan({ cls: 'gdrive-fod-check gdrive-fod-upload' });
+      cb.setAttr('role', 'button');
+      cb.setAttr('aria-label', t('panel.uploadAria'));
+      cb.onclick = async (e) => {
+        e.stopPropagation();
+        this.syncing.add(node.path);
+        await this.render();
+        try {
+          await this.create.uploadLocal(node.path, node.isFolder, parentDriveId);
+          this.model.invalidate(parentDriveId); // le fichier est maintenant sur Drive
+        } catch (err) {
+          new Notice(t('panel.errorSync', { error: String(err) }));
+        } finally {
+          this.syncing.delete(node.path);
+          await this.render();
+        }
+      };
+    } else {
+      // à l'intérieur d'un dossier local-only : on téléverse le dossier parent en entier
+      row.createSpan({ cls: 'gdrive-fod-check gdrive-fod-upload is-disabled' });
+    }
+
+    const icon = row.createSpan({ cls: 'gdrive-fod-icon' });
+    setIcon(icon, node.isFolder ? (this.model.isExpanded(node.path) ? 'chevron-down' : 'chevron-right') : 'file');
+    row.createSpan({ text: ' ' + node.name });
+
+    if (node.isFolder) {
+      row.onclick = async () => {
+        this.model.toggle(node.path);
+        await this.render();
+      };
+      if (this.model.isExpanded(node.path)) {
+        const children = await this.model.loadChildren(node.id, node.path); // id `local:` → enfants locaux
+        for (const c of children) await this.renderNode(c, depth + 1, null); // pas de parent Drive réel
       }
     }
   }

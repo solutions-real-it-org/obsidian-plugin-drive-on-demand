@@ -30,6 +30,7 @@ function fakeVault() {
     readBinary: async () => new ArrayBuffer(0),
     remove: async (p) => { files.delete(p); folders.delete(p); },
     isEmptyFolder: (p) => folders.has(p) && ![...files, ...folders].some((x) => x.startsWith(p + '/')),
+    listChildren: () => [],
   };
   return { vault, files, folders, written };
 }

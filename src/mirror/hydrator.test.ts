@@ -19,6 +19,7 @@ function fakeVault() {
     readBinary: async () => new ArrayBuffer(0),
     remove: async () => {},
     isEmptyFolder: () => false,
+    listChildren: () => [],
   };
   return { vault, written };
 }

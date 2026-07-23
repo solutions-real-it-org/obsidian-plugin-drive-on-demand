@@ -111,11 +111,13 @@ export class SyncEngine {
 
   async syncFile(node: TreeNode, token?: CancelToken): Promise<void> {
     token?.throwIfCancelled();
+    const meta = node.meta;
+    if (!meta) return; // nœud « local-only » : téléversé via CreateManager.uploadLocal, pas ici
     let localPath = node.path;
-    if (isGoogleNative(node.meta.mimeType)) {
-      localPath = await this.materializeGoogleNativeLink(node.path, node.meta);
+    if (isGoogleNative(meta.mimeType)) {
+      localPath = await this.materializeGoogleNativeLink(node.path, meta);
     } else {
-      await this.materialize(node.path, node.meta);
+      await this.materialize(node.path, meta);
     }
     await this.state.setFileSynced(localPath, true);
   }
@@ -150,7 +152,7 @@ export class SyncEngine {
     }
     // indexer le dossier racine et les sous-dossiers
     await this.index.set(node.path, {
-      driveId: node.id, mimeType: node.meta.mimeType, isFolder: true, hydrated: true, pinned: true,
+      driveId: node.id, mimeType: node.meta?.mimeType ?? 'application/vnd.google-apps.folder', isFolder: true, hydrated: true, pinned: true,
     });
     for (const f of folders) {
       await this.index.set(f.path, {

@@ -146,6 +146,32 @@ describe('DriveTreeModel', () => {
     expect(model.isOffline()).toBe(true);
   });
 
+  it('fusionne les fichiers LOCAUX absents de Drive en nœuds « local-only » (grisés)', async () => {
+    const { drive } = driveWith({ root: [file('f1', 'sur-drive.md')] });
+    const listLocal = (p: string) =>
+      p === '' ? [{ name: 'sur-drive.md', isFolder: false }, { name: 'local-seul.md', isFolder: false }, { name: '.obsidian', isFolder: true }] : [];
+    const model = new DriveTreeModel(drive, undefined, undefined, listLocal);
+    const nodes = await model.loadChildren('root', '');
+    const names = nodes.map((n) => n.name);
+    expect(names).toContain('sur-drive.md');
+    expect(names).toContain('local-seul.md'); // présent en local, pas sur Drive → local-only
+    expect(names).not.toContain('.obsidian'); // ignoré
+    const local = nodes.find((n) => n.name === 'local-seul.md');
+    expect(local?.localOnly).toBe(true);
+    expect(local?.id.startsWith('local:')).toBe(true);
+    expect(nodes.find((n) => n.name === 'sur-drive.md')?.localOnly).toBeUndefined(); // sur Drive
+  });
+
+  it('un dossier local-only (id local:) se déplie depuis le LOCAL, sans appel Drive', async () => {
+    const { drive, http } = driveWith({});
+    const listLocal = (p: string) => (p === 'dossierlocal' ? [{ name: 'x.md', isFolder: false }] : []);
+    const model = new DriveTreeModel(drive, undefined, undefined, listLocal);
+    const nodes = await model.loadChildren('local:dossierlocal', 'dossierlocal');
+    expect(http).not.toHaveBeenCalled();
+    expect(nodes.map((n) => n.name)).toEqual(['x.md']);
+    expect(nodes[0].localOnly).toBe(true);
+  });
+
   it('notifie onStatus au passage en/hors-ligne', async () => {
     const { drive } = driveWith({ root: [file('f1', 'a.md')] });
     const statuses: boolean[] = [];

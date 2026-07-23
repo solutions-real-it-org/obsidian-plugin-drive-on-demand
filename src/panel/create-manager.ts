@@ -50,6 +50,18 @@ export class CreateManager {
     return run;
   }
 
+  /** Téléverse un fichier/dossier LOCAL (grisé dans le panneau) sous un dossier Drive
+   *  DÉJÀ connu (celui en cours d'exploration). Contrairement à handleCreate, ne dépend
+   *  pas d'un ancêtre déjà suivi : le parent Drive est fourni explicitement. */
+  uploadLocal(path: string, isFolder: boolean, parentDriveId: string): Promise<CreateResult> {
+    const run = this.queue.then(
+      () => this.createUnder(toNfc(path), isFolder, parentDriveId),
+      () => this.createUnder(toNfc(path), isFolder, parentDriveId),
+    );
+    this.queue = run.catch(() => undefined);
+    return run;
+  }
+
   /** Enfant Drive d'un dossier par nom (dédup ; évite les doublons de dossiers/fichiers). */
   private async childId(parentDriveId: string, name: string, wantFolder: boolean): Promise<string | undefined> {
     const kids = await this.opts.drive.children(parentDriveId);
@@ -133,21 +145,32 @@ export class CreateManager {
   private async process(path: string, isFolder: boolean): Promise<CreateResult> {
     if (this.opts.wasPluginCreated?.(path)) return 'skipped';
     if (isIgnored(path) || this.opts.index.get(path)) return 'skipped';
-    const parts = path.split('/');
-    const name = parts[parts.length - 1];
-
     const parentDriveId = await this.resolveParentDriveId(path);
     if (parentDriveId === null) return 'skipped'; // hors zone synchronisée
+    return this.createUnder(path, isFolder, parentDriveId);
+  }
+
+  /** Crée `path` (fichier ou dossier) sur Drive sous `parentDriveId`. Pour un dossier,
+   *  crée aussi récursivement son contenu LOCAL (fichiers créés/déposés dedans). */
+  private async createUnder(path: string, isFolder: boolean, parentDriveId: string): Promise<CreateResult> {
+    if (isIgnored(path)) return 'skipped';
+    const name = path.split('/').pop() as string;
 
     if (isFolder) {
       let id = await this.childId(parentDriveId, name, true);
       if (!id) id = (await this.opts.drive.createDriveFolder(parentDriveId, name)).id;
       await this.opts.index.set(path, FOLDER_ENTRY(id));
+      // téléverse le contenu local du dossier (récursif)
+      for (const child of this.opts.vault.listChildren(path)) {
+        await this.createUnder(`${path}/${child.name}`, child.isFolder, id);
+      }
+      // marque le dossier « plein » → nouveaux fichiers dedans synchronisés automatiquement
+      await this.opts.state.setFolderFull(path, [], [], true);
       return 'created';
     }
+
     // fichier : si un fichier du même nom existe déjà sur Drive → ne pas dupliquer/écraser
     if (await this.childId(parentDriveId, name, false)) return 'skipped';
-
     if (isTextName(name)) {
       const content = await this.opts.vault.readText(path);
       const { id, headRevisionId } = await this.opts.drive.createFile(parentDriveId, name, content);
