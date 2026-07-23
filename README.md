@@ -46,6 +46,13 @@ Your Google **refresh token is stored locally** in the plugin's own data (`data.
 
 A **Google account** is required (to authorise Drive access). You connect it once via **Settings → Drive on Demand → Connect my account**. When the paid plan launches, a Real-IT account/subscription will additionally be required for full access.
 
+### Advanced: use your own Google credentials (no user cap)
+
+Prefer to stay fully independent of the Real-IT broker? You can connect the
+plugin to **your own Google Cloud project** — this removes the managed
+service's 100-user cap and the weekly re-login. See the step-by-step guide:
+**[docs/setup-byo.md](docs/setup-byo.md)**.
+
 ---
 
 ## Installation
