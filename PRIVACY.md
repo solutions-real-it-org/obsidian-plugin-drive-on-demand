@@ -30,7 +30,7 @@ This data is under your control. Removing the plugin and its folder deletes it.
 
 ## What the authentication broker processes
 
-The broker (`https://obsidian-drive.real-it.org`, operated by Real-IT) is
+The broker (`https://obsidian-drive-on-demand.solutions.real-it.org`, operated by Real-IT) is
 involved **only** during Google authentication:
 
 - **Sign-in:** it exchanges the one-time Google authorization code for tokens,
