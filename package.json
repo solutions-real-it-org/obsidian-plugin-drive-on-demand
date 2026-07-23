@@ -1,0 +1,22 @@
+{
+  "name": "obsidian-plugin-drive-on-demand",
+  "version": "1.0.0",
+  "description": "Browse, sync and edit your Google Drive from Obsidian — files-on-demand, selective offline, automatic two-way sync.",
+  "author": "Real-IT (Loïc Bertrand)",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "node esbuild.config.mjs production",
+    "dev": "node esbuild.config.mjs",
+    "test": "vitest run",
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "builtin-modules": "^4.0.0",
+    "esbuild": "^0.24.0",
+    "obsidian": "^1.7.2",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}

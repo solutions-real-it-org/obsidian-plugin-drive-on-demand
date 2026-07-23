@@ -1,0 +1,73 @@
+import type { DriveNode } from '../drive/drive-client';
+import type { MirrorIndex, MirrorEntry } from './mirror-index';
+
+export interface VaultOps {
+  exists(path: string): Promise<boolean>;
+  createFolder(path: string): Promise<void>;
+  createStub(path: string): Promise<void>;
+  writeText(path: string, data: string): Promise<void>;
+  writeBinary(path: string, data: ArrayBuffer): Promise<void>;
+  readText(path: string): Promise<string>;
+  readBinary(path: string): Promise<ArrayBuffer>;
+  remove(path: string): Promise<void>;
+  isEmptyFolder(path: string): boolean;
+}
+
+/** Vrai si un segment du chemin est une traversée de répertoire ('.', '..') ou vide.
+ *  Un nom Drive (contrôlé par le compte connecté ou tout collaborateur qui y partage
+ *  un fichier) peut contenir '..' ou '/' sans restriction — non filtré, un tel chemin
+ *  pourrait faire écrire/lire/supprimer un fichier HORS du vault. */
+export function hasUnsafeSegment(path: string): boolean {
+  return path.split('/').some((seg) => seg === '.' || seg === '..' || seg === '');
+}
+
+export function isIgnored(path: string): boolean {
+  return path.split('/').includes('.obsidian') || hasUnsafeSegment(path);
+}
+
+export class TreeMirror {
+  constructor(
+    private vault: VaultOps,
+    private index: MirrorIndex,
+  ) {}
+
+  async sync(nodes: DriveNode[]): Promise<{ created: number; skipped: number }> {
+    // dossiers d'abord, du moins profond au plus profond, pour que les parents existent
+    const ordered = [...nodes].sort((a, b) => {
+      if (a.isFolder !== b.isFolder) return a.isFolder ? -1 : 1;
+      return a.path.split('/').length - b.path.split('/').length;
+    });
+    let created = 0;
+    let skipped = 0;
+    for (const n of ordered) {
+      if (isIgnored(n.path)) continue;
+      const existing = this.index.get(n.path);
+      const alreadyInVault = await this.vault.exists(n.path);
+      // Ne jamais auto-écraser un fichier qu'on n'a pas créé :
+      // - entrée déjà connue → on préserve son état local (hydraté/épinglé)
+      // - dossier → rien à hydrater
+      // - fichier déjà présent dans le vault mais inconnu de l'index → contenu utilisateur → marqué hydraté (pas de download par-dessus)
+      // - sinon (stub vide qu'on va créer) → hydratable
+      const hydrated = existing ? existing.hydrated : n.isFolder || alreadyInVault ? true : false;
+      const entry: MirrorEntry = {
+        driveId: n.id,
+        mimeType: n.mimeType,
+        isFolder: n.isFolder,
+        hydrated,
+        pinned: existing ? existing.pinned : false,
+        headRevisionId: n.headRevisionId,
+        modifiedTime: n.modifiedTime,
+        md5Checksum: n.md5Checksum,
+      };
+      if (alreadyInVault) {
+        skipped++;
+      } else {
+        if (n.isFolder) await this.vault.createFolder(n.path);
+        else await this.vault.createStub(n.path);
+        created++;
+      }
+      await this.index.set(n.path, entry);
+    }
+    return { created, skipped };
+  }
+}

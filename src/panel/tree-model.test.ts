@@ -1,0 +1,159 @@
+import { describe, it, expect, vi } from 'vitest';
+import { DriveTreeModel } from './tree-model';
+import { DriveClient } from '../drive/drive-client';
+import type { HttpFn, HttpResponse } from '../http';
+import type { PersistAdapter } from '../auth/token-store';
+
+function memAdapter() {
+  const raw: Record<string, unknown> = {};
+  const a: PersistAdapter = {
+    async load() { return raw; },
+    async save(d) { Object.keys(raw).forEach((k) => delete raw[k]); Object.assign(raw, d); },
+  };
+  return { a, raw };
+}
+/** Drive dont le http lève (simule le hors-ligne / injoignable). */
+function driveOffline(kind: 'network' | 'auth' = 'network'): DriveClient {
+  const http = vi.fn(async () => {
+    throw new Error(kind === 'auth' ? 'NEED_INTERACTIVE_AUTH' : 'net::ERR_INTERNET_DISCONNECTED');
+  });
+  return new DriveClient(http as unknown as HttpFn, async () => 'AT');
+}
+
+function res(status: number, body: unknown): HttpResponse {
+  const text = JSON.stringify(body);
+  return { status, text, json: <T>() => JSON.parse(text) as T };
+}
+function driveWith(byFolder: Record<string, unknown[]>): { drive: DriveClient; http: ReturnType<typeof vi.fn> } {
+  const http = vi.fn(async (req: { url: string }) => {
+    const m = /%27([^%]+)%27%20in%20parents/.exec(req.url);
+    const fid = m ? m[1] : 'root';
+    return res(200, { files: byFolder[fid] ?? [] });
+  });
+  return { drive: new DriveClient(http as unknown as HttpFn, async () => 'AT'), http };
+}
+const folder = (id: string, name: string) => ({ id, name, mimeType: 'application/vnd.google-apps.folder', modifiedTime: 't' });
+const file = (id: string, name: string) => ({ id, name, mimeType: 'text/markdown', modifiedTime: 't' });
+
+describe('DriveTreeModel', () => {
+  it('charge les enfants de la racine, dossiers avant fichiers, triés alpha', async () => {
+    const { drive } = driveWith({ root: [file('f1', 'zeta.md'), folder('d1', 'Beta'), file('f2', 'alpha.md')] });
+    const model = new DriveTreeModel(drive);
+    const nodes = await model.loadChildren('root', '');
+    expect(nodes.map((n) => n.name)).toEqual(['Beta', 'alpha.md', 'zeta.md']);
+    expect(nodes[0].isFolder).toBe(true);
+    expect(nodes[0].path).toBe('Beta');
+  });
+
+  it('calcule les chemins relatifs à partir du parent', async () => {
+    const { drive } = driveWith({ d1: [file('f1', 'note.md')] });
+    const model = new DriveTreeModel(drive);
+    const nodes = await model.loadChildren('d1', 'cycles');
+    expect(nodes[0].path).toBe('cycles/note.md');
+  });
+
+  it('met en cache : 2e loadChildren ne refetch pas', async () => {
+    const { drive, http } = driveWith({ root: [file('f1', 'a.md')] });
+    const model = new DriveTreeModel(drive);
+    await model.loadChildren('root', '');
+    await model.loadChildren('root', '');
+    expect(http).toHaveBeenCalledTimes(1);
+    model.invalidate('root');
+    await model.loadChildren('root', '');
+    expect(http).toHaveBeenCalledTimes(2);
+  });
+
+  it('toggle / isExpanded suivent l état déplié', () => {
+    const { drive } = driveWith({});
+    const model = new DriveTreeModel(drive);
+    expect(model.isExpanded('cycles')).toBe(false);
+    model.toggle('cycles');
+    expect(model.isExpanded('cycles')).toBe(true);
+    model.toggle('cycles');
+    expect(model.isExpanded('cycles')).toBe(false);
+  });
+
+  it('.obsidian est totalement masqué de l arbre navigable', async () => {
+    const { drive } = driveWith({
+      root: [folder('obs-id', '.obsidian'), file('f1', 'note.md')],
+    });
+    const model = new DriveTreeModel(drive);
+    const nodes = await model.loadChildren('root', '');
+    expect(nodes.map((n) => n.name)).toEqual(['note.md']);
+  });
+
+  it('un .obsidian imbriqué dans un sous-dossier est aussi masqué', async () => {
+    const { drive } = driveWith({
+      sub: [folder('obs-id', '.obsidian'), file('f1', 'note.md')],
+    });
+    const model = new DriveTreeModel(drive);
+    const nodes = await model.loadChildren('sub', 'sous-dossier');
+    expect(nodes.map((n) => n.name)).toEqual(['note.md']);
+  });
+
+  it('un nom Drive malveillant (traversée de chemin) est masqué de l arbre — sécurité', async () => {
+    const { drive } = driveWith({
+      root: [file('evil', '../../../etc/passwd'), folder('d1', '..'), file('f1', 'note.md')],
+    });
+    const model = new DriveTreeModel(drive);
+    const nodes = await model.loadChildren('root', '');
+    expect(nodes.map((n) => n.name)).toEqual(['note.md']);
+  });
+
+  it('persiste le cache et le relit au redémarrage (survit à une nouvelle instance)', async () => {
+    const { a } = memAdapter();
+    const { drive, http } = driveWith({ root: [file('f1', 'a.md')] });
+    const m1 = new DriveTreeModel(drive, a);
+    await m1.load();
+    await m1.loadChildren('root', '');
+    expect(http).toHaveBeenCalledTimes(1);
+
+    // nouvelle instance dont le Drive est injoignable : le cache persisté doit suffire à
+    // afficher l'arbre SANS aucune tentative réseau (donc pas marqué offline — on n'a pas
+    // essayé d'aller en ligne ; le témoin n'apparaît qu'à un refetch qui échoue).
+    const offlineHttp = vi.fn(async () => { throw new Error('net::ERR'); });
+    const m2 = new DriveTreeModel(new DriveClient(offlineHttp as unknown as HttpFn, async () => 'AT'), a);
+    await m2.load();
+    const nodes = await m2.loadChildren('root', '');
+    expect(nodes.map((n) => n.name)).toEqual(['a.md']);
+    expect(offlineHttp).not.toHaveBeenCalled(); // servi depuis le cache, zéro réseau
+    expect(m2.isOffline()).toBe(false);
+  });
+
+  it('hors-ligne sans cache : remonte l erreur (rien à afficher)', async () => {
+    const model = new DriveTreeModel(driveOffline());
+    await expect(model.loadChildren('root', '')).rejects.toThrow();
+    expect(model.isOffline()).toBe(true);
+  });
+
+  it('un problème d auth (NEED_INTERACTIVE_AUTH) n est PAS traité comme hors-ligne', async () => {
+    const model = new DriveTreeModel(driveOffline('auth'));
+    await expect(model.loadChildren('root', '')).rejects.toThrow('NEED_INTERACTIVE_AUTH');
+    expect(model.isOffline()).toBe(false);
+  });
+
+  it('invalidate + refetch hors-ligne : garde le cache au lieu de le perdre', async () => {
+    const { a } = memAdapter();
+    const { drive } = driveWith({ root: [file('f1', 'a.md')] });
+    const model = new DriveTreeModel(drive, a);
+    await model.load();
+    await model.loadChildren('root', ''); // met en cache
+    // simule une bascule hors-ligne : on remplace le drive par un injoignable
+    (model as unknown as { drive: DriveClient }).drive = driveOffline();
+    model.invalidate('root'); // force refetch → échouera
+    const nodes = await model.loadChildren('root', '');
+    expect(nodes.map((n) => n.name)).toEqual(['a.md']); // cache préservé
+    expect(model.isOffline()).toBe(true);
+  });
+
+  it('notifie onStatus au passage en/hors-ligne', async () => {
+    const { drive } = driveWith({ root: [file('f1', 'a.md')] });
+    const statuses: boolean[] = [];
+    const model = new DriveTreeModel(drive, undefined, (o) => statuses.push(o));
+    await model.loadChildren('root', ''); // online → pas de changement (déjà false), pas de notif
+    (model as unknown as { drive: DriveClient }).drive = driveOffline();
+    model.invalidate('root');
+    await model.loadChildren('root', '').catch(() => undefined);
+    expect(statuses).toContain(true); // passage hors-ligne notifié
+  });
+});

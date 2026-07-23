@@ -1,0 +1,299 @@
+// src/panel/tree-view.ts
+import { ItemView, WorkspaceLeaf, Notice, setIcon } from 'obsidian';
+import { DriveTreeModel, type TreeNode } from './tree-model';
+import type { SelectiveSyncState } from './selective-sync-state';
+import { SyncEngine } from './sync-engine';
+import { DriveClient, isGoogleNative } from '../drive/drive-client';
+import { CancelToken, isCancelledError } from '../util/cancel-token';
+import { FolderPickerModal } from './folder-picker-modal';
+import { confirmModal } from './confirm-modal';
+import type { WorkingRootStore, WorkingRoot } from './working-root';
+import { t } from '../i18n';
+
+export const VIEW_TYPE = 'gdrive-fod-tree';
+
+export class DriveTreeView extends ItemView {
+  private treeEl!: HTMLElement;
+  // NB : ne PAS nommer ce champ `titleEl` — c'est une propriété réservée d'ItemView/View
+  // dans Obsidian (obsidian.d.ts). Un champ de classe du même nom l'écrase avec `undefined`
+  // à la construction, et l'ouverture interne de la vue (`this.titleEl.setText(...)`) plante
+  // → « Cannot read properties of undefined (reading 'setText') », panneau blanc.
+  private panelTitleEl!: HTMLElement;
+  private refreshIconEl?: HTMLElement;
+  private syncing = new Set<string>();
+  private cancelTokens = new Map<string, CancelToken>();
+  /** Fichiers déjà traités (succès ou échec) au sein d'une sync de dossier encore en
+   *  cours — leur spinner doit disparaître dès leur propre fin, sans attendre que
+   *  syncing.delete(dossier) n'arrive à la toute fin de l'opération complète. */
+  private doneWithinSync = new Set<string>();
+  private accountEmail?: string;
+
+  constructor(
+    leaf: WorkspaceLeaf,
+    private model: DriveTreeModel,
+    private state: SelectiveSyncState,
+    private engine: SyncEngine,
+    private drive: DriveClient,
+    private workingRoot: WorkingRootStore,
+  ) {
+    super(leaf);
+  }
+
+  getViewType(): string {
+    return VIEW_TYPE;
+  }
+  getDisplayText(): string {
+    return t('panel.title');
+  }
+  getIcon(): string {
+    return 'cloud';
+  }
+
+  async onOpen(): Promise<void> {
+    // Quand Internet revient, on rafraîchit les données du panneau (l'ÉTAT de connexion,
+    // lui, n'est affiché QUE dans la status bar). registerDomEvent est nettoyé auto.
+    this.registerDomEvent(window, 'online', () => void this.revalidate());
+    // Le panneau ne doit JAMAIS rester blanc silencieusement : toute erreur d'ouverture
+    // est rendue visible à l'écran (message + stack), pas seulement dans la console.
+    try {
+      await this.renderPanel();
+    } catch (e) {
+      this.renderFatalError(e);
+    }
+  }
+
+  private async renderPanel(): Promise<void> {
+    const root = this.contentEl;
+    root.empty();
+    const header = root.createDiv({ cls: 'gdrive-fod-header' });
+    // Titre + arbre créés EN PREMIER → toujours visibles, même si la décoration du
+    // header (icône rafraîchir / dossier) venait à échouer. Le panneau ne peut plus être blanc.
+    this.panelTitleEl = header.createSpan({ cls: 'gdrive-fod-title is-clickable' });
+    this.panelTitleEl.onclick = () => this.openFolderPicker();
+    this.updateTitle();
+    this.treeEl = root.createDiv({ cls: 'gdrive-fod-tree' });
+    // Décoration isolée : icônes du header = un « plus », jamais un point de blocage.
+    try {
+      const refreshIcon = header.createSpan({ cls: 'gdrive-fod-refresh-icon' });
+      header.prepend(refreshIcon); // à gauche du titre
+      setIcon(refreshIcon, 'refresh-cw');
+      refreshIcon.setAttr('aria-label', t('panel.refreshButton'));
+      refreshIcon.setAttr('role', 'button');
+      refreshIcon.onclick = () => void this.refresh();
+      this.refreshIconEl = refreshIcon;
+      // bouton « choisir le dossier de travail » (à droite)
+      const pickIcon = header.createSpan({ cls: 'gdrive-fod-pick-icon' });
+      setIcon(pickIcon, 'folder-tree');
+      pickIcon.setAttr('aria-label', t('panel.pickFolderAria'));
+      pickIcon.setAttr('role', 'button');
+      pickIcon.onclick = () => this.openFolderPicker();
+    } catch (e) {
+      console.error('[gdrive-fod] décoration du header échouée (non bloquant)', e);
+    }
+    void this.loadAccountEmail();
+    await this.render();          // affichage instantané (cache si disponible)
+    void this.revalidate();       // en arrière-plan : rafraîchit la racine si en ligne
+  }
+
+  /** Revalidation silencieuse (sans spinner) de la racine : rafraîchit les données quand
+   *  c'est possible ; en cas d'échec réseau, le cache reste affiché (le modèle gère le
+   *  repli hors-ligne). L'ÉTAT de connexion est affiché uniquement dans la status bar. */
+  private async revalidate(): Promise<void> {
+    if (!this.treeEl) return; // vue pas encore rendue (ex. événement réseau très tôt)
+    this.model.invalidate(this.workingRoot.rootId());
+    await this.render();
+  }
+
+  /** Titre du header : nom du dossier de travail si défini, sinon l'email du compte
+   *  (dès qu'il est connu), sinon le libellé générique. */
+  private updateTitle(): void {
+    if (!this.panelTitleEl) return;
+    const wr = this.workingRoot.get();
+    if (wr) this.panelTitleEl.setText('📁 ' + wr.name);
+    else this.panelTitleEl.setText(this.accountEmail ?? t('panel.title'));
+  }
+
+  private openFolderPicker(): void {
+    new FolderPickerModal(this.app, this.drive, (picked) => void this.applyWorkingRoot(picked)).open();
+  }
+
+  /** Applique un nouveau dossier de travail. Si du contenu est déjà synchronisé, demande
+   *  confirmation puis désynchronise l'ancien périmètre (fichiers retirés du vault, gardés
+   *  sur Drive) avant de basculer — le vault reflète alors proprement le nouveau dossier. */
+  private async applyWorkingRoot(picked: WorkingRoot | null): Promise<void> {
+    const current = this.workingRoot.get();
+    const sameId = (picked?.id ?? 'root') === (current?.id ?? 'root');
+    if (sameId) return; // aucun changement
+
+    const syncedCount = this.state.allSynced().length;
+    if (syncedCount > 0) {
+      const ok = await confirmModal(this.app, t('picker.switchConfirm', { count: syncedCount }), t('picker.chooseThisFolder'));
+      if (!ok) return;
+      try {
+        await this.engine.unsyncAll();
+      } catch (e) {
+        new Notice(t('panel.errorSync', { error: String(e) }));
+        return;
+      }
+    }
+
+    if (picked) await this.workingRoot.set(picked.id, picked.name);
+    else await this.workingRoot.reset();
+    new Notice(picked ? t('panel.workingRootChanged', { name: picked.name }) : t('panel.workingRootReset'));
+    this.model.invalidate(this.workingRoot.rootId());
+    this.updateTitle();
+    await this.render();
+  }
+
+  /** Dernier rempart : affiche l'erreur d'ouverture directement dans le panneau
+   *  (au lieu d'un blanc muet), pour qu'elle soit lisible sans ouvrir la console. */
+  private renderFatalError(e: unknown): void {
+    console.error('[gdrive-fod] onOpen a échoué', e);
+    try {
+      const root = this.contentEl;
+      root.empty();
+      const box = root.createDiv({ cls: 'gdrive-fod-fatal' });
+      box.createEl('div', { text: '⚠ Google Drive — ' + t('panel.error', { error: '' }) });
+      const pre = box.createEl('pre');
+      pre.setText(e instanceof Error ? (e.stack ?? e.message) : String(e));
+    } catch (inner) {
+      console.error('[gdrive-fod] échec du rendu de l erreur', inner, e);
+    }
+  }
+
+  /** Affiche l email du compte Google connecté à la place de « Google Drive » dès
+   *  qu'il est connu — best-effort, ne bloque jamais l'ouverture du panneau (pas
+   *  encore connecté, token expiré, etc. → le titre générique reste affiché). */
+  private async loadAccountEmail(): Promise<void> {
+    try {
+      const { email } = await this.drive.aboutUser();
+      if (email) {
+        this.accountEmail = email;
+        this.updateTitle(); // n'écrase pas un nom de dossier de travail (cf. updateTitle)
+      }
+    } catch {
+      // pas connecté / erreur réseau : garder le titre générique, non bloquant
+    }
+  }
+
+  private async render(): Promise<void> {
+    this.treeEl.empty();
+    try {
+      const rootNodes = await this.model.loadChildren(this.workingRoot.rootId(), '');
+      for (const n of rootNodes) await this.renderNode(n, 0);
+    } catch (e) {
+      if (String(e).includes('NEED_INTERACTIVE_AUTH')) {
+        this.treeEl.createEl('div', { text: t('panel.notConnected') });
+      } else {
+        this.treeEl.createEl('div', { text: t('panel.error', { error: String(e) }) });
+      }
+    }
+  }
+
+  private async refresh(): Promise<void> {
+    // refreshIconEl peut être absent si la décoration du header a échoué (cf. renderPanel).
+    this.refreshIconEl?.addClass('is-spinning');
+    try {
+      this.model.invalidate(this.workingRoot.rootId());
+      await this.render();
+    } finally {
+      this.refreshIconEl?.removeClass('is-spinning');
+    }
+  }
+
+  /** Chemin local réellement suivi par le state/index pour ce nœud — les fichiers Google
+   *  natifs (Docs/Sheets/Slides) sont matérialisés sous `<path>.md` (voir SyncEngine). */
+  private effectivePath(node: TreeNode): string {
+    return !node.isFolder && isGoogleNative(node.meta.mimeType)
+      ? SyncEngine.googleNativeLocalPath(node.path)
+      : node.path;
+  }
+
+  /** Le nœud syncing (lui-même ou un ancêtre dont la sync est en cours) dont dépend `path`,
+   *  ou undefined si rien n'est en cours. Un dossier en cours de sync/désync met en spinner
+   *  tout son sous-arbre affiché (chargé ou pas encore chargé au moment du clic), jusqu'à ce
+   *  que l'opération complète — fichier ou dossier — se termine. */
+  private syncingAncestor(path: string): string | undefined {
+    if (this.doneWithinSync.has(path)) return undefined; // déjà traité individuellement
+    if (this.syncing.has(path)) return path;
+    for (const s of this.syncing) {
+      if (path.startsWith(s + '/')) return s;
+    }
+    return undefined;
+  }
+
+  private async renderNode(node: TreeNode, depth: number): Promise<void> {
+    const row = this.treeEl.createDiv({ cls: 'gdrive-fod-row' });
+    row.style.paddingLeft = `${depth * 16}px`;
+    row.style.cursor = 'pointer';
+
+    const st = node.isFolder ? this.state.folderState(node.path) : this.state.fileState(this.effectivePath(node));
+    const activeSync = this.syncingAncestor(node.path);
+    if (activeSync) {
+      const sp = row.createSpan({ cls: 'gdrive-fod-spinner' });
+      sp.setAttr('aria-label', t('panel.cancelAria'));
+      sp.onclick = (e) => {
+        e.stopPropagation();
+        this.cancelTokens.get(activeSync)?.cancel();
+      };
+    } else {
+      const cb = row.createSpan({ cls: 'gdrive-fod-check' });
+      cb.dataset.state = st; // 'checked' | 'partial' | 'unchecked'
+      cb.setAttr('role', 'checkbox');
+      cb.setAttr('aria-checked', st === 'checked' ? 'true' : st === 'partial' ? 'mixed' : 'false');
+      cb.onclick = async (e) => {
+        e.stopPropagation();
+        const wantChecked = st !== 'checked'; // vide/partiel → cocher (tout) ; plein → décocher
+        const token = new CancelToken();
+        this.cancelTokens.set(node.path, token);
+        this.syncing.add(node.path);
+        await this.render();
+        const thisRunDone: string[] = [];
+        try {
+          if (!node.isFolder) {
+            if (wantChecked) await this.engine.syncFile(node, token);
+            else await this.engine.unsyncFile(this.effectivePath(node), token);
+          } else if (wantChecked) {
+            const plan = await this.engine.planFolderSync(node, token);
+            const result = await this.engine.applyFolderSync(node, plan, token, (path) => {
+              thisRunDone.push(path);
+              this.doneWithinSync.add(path);
+              void this.render();
+            });
+            if (result.failed.length > 0) {
+              new Notice(t('panel.someFilesFailed', { count: result.failed.length }));
+            }
+          } else {
+            await this.engine.unsyncFolder(node, token);
+          }
+        } catch (err) {
+          if (!isCancelledError(err)) new Notice(t('panel.errorSync', { error: String(err) }));
+        } finally {
+          this.cancelTokens.delete(node.path);
+          this.syncing.delete(node.path);
+          for (const p of thisRunDone) this.doneWithinSync.delete(p);
+          await this.render();
+        }
+      };
+    }
+
+    const icon = row.createSpan({ cls: 'gdrive-fod-icon' });
+    setIcon(icon, node.isFolder ? (this.model.isExpanded(node.path) ? 'chevron-down' : 'chevron-right') : 'file');
+    row.createSpan({ text: ' ' + node.name });
+
+    if (node.isFolder) {
+      row.onclick = async () => {
+        this.model.toggle(node.path);
+        await this.render();
+      };
+      if (this.model.isExpanded(node.path)) {
+        const children = await this.model.loadChildren(node.id, node.path);
+        for (const c of children) await this.renderNode(c, depth + 1);
+      }
+    }
+  }
+
+  async onClose(): Promise<void> {
+    this.contentEl.empty();
+  }
+}
