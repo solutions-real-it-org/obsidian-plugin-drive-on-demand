@@ -14,7 +14,7 @@ function ad() {
   return a;
 }
 function vaultReturning(content: string): VaultOps {
-  return { exists: async () => true, createFolder: async () => {}, createStub: async () => {}, writeText: async () => {}, writeBinary: async () => {}, readText: async () => content, readBinary: async () => new ArrayBuffer(0), remove: async () => {}, isEmptyFolder: () => false, listChildren: () => [] };
+  return { exists: async () => true, createFolder: async () => {}, createStub: async () => {}, writeText: async () => {}, writeBinary: async () => {}, readText: async () => content, readBinary: async () => new ArrayBuffer(0), remove: async () => {}, isEmptyFolder: () => false, rename: async () => {}, listChildren: () => [] };
 }
 function driveSpy() {
   const http = vi.fn(async () => ({ status: 200, text: '{}', json: <T>() => ({}) as T }) as HttpResponse) as unknown as HttpFn;
@@ -120,7 +120,7 @@ describe('PushManager', () => {
       exists: async () => true, createFolder: async () => {}, createStub: async () => {},
       writeText: async (p, d) => { conflictWrites.push({ path: p, content: d }); },
       writeBinary: async () => {}, readText: async () => 'edit local', readBinary: async () => new ArrayBuffer(0), remove: async () => {},
-      isEmptyFolder: () => false, listChildren: () => [],
+      isEmptyFolder: () => false, rename: async () => {}, listChildren: () => [],
     };
     const { drive, calls } = driveSpy();
     vi.spyOn(drive, 'getRevision').mockResolvedValue({ headRevisionId: 'r2' }); // distant a bougé

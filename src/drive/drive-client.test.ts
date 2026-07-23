@@ -241,21 +241,25 @@ describe('DriveClient.getStartPageToken / listChanges', () => {
     expect(call.url).toContain('/changes/startPageToken');
   });
 
-  it('listChanges sépare modifiés / supprimés (removed ou trashed) et remonte les jetons', async () => {
+  it('listChanges remonte fileId + removed (removed ou trashed) + nom/parents actuels', async () => {
     const http = vi.fn(async () => res(200, {
       changes: [
-        { fileId: 'A', file: { trashed: false } },
+        { fileId: 'A', file: { name: 'Renommé.md', parents: ['P1'], trashed: false } },
         { fileId: 'B', removed: true },
         { fileId: 'C', file: { trashed: true } },
       ],
       newStartPageToken: 'TOK2',
     })) as unknown as HttpFn;
     const r = await new DriveClient(http, token).listChanges('TOK1');
-    expect(r.changed).toEqual(['A']);
-    expect(r.removed.sort()).toEqual(['B', 'C']);
+    expect(r.changes).toEqual([
+      { fileId: 'A', removed: false, name: 'Renommé.md', parents: ['P1'], mimeType: undefined },
+      { fileId: 'B', removed: true, name: undefined, parents: undefined, mimeType: undefined },
+      { fileId: 'C', removed: true, name: undefined, parents: undefined, mimeType: undefined },
+    ]);
     expect(r.newStartPageToken).toBe('TOK2');
     const call = (http as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(call.url).toContain('pageToken=TOK1');
+    expect(call.url).toContain(encodeURIComponent('file(name,parents,trashed,mimeType)'));
   });
 
   it('listChanges remonte nextPageToken pour la pagination', async () => {

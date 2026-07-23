@@ -13,7 +13,7 @@ function driveObj() {
   return new DriveClient(http, async () => 'AT');
 }
 function vaultObj(local = 'contenu') {
-  const vault: VaultOps = { exists: async () => true, createFolder: async () => {}, createStub: async () => {}, writeText: async () => {}, writeBinary: async () => {}, readText: async () => local, readBinary: async () => new ArrayBuffer(0), remove: async () => {}, isEmptyFolder: () => false, listChildren: () => [] };
+  const vault: VaultOps = { exists: async () => true, createFolder: async () => {}, createStub: async () => {}, writeText: async () => {}, writeBinary: async () => {}, readText: async () => local, readBinary: async () => new ArrayBuffer(0), remove: async () => {}, isEmptyFolder: () => false, rename: async () => {}, listChildren: () => [] };
   return vault;
 }
 const folderEntry = (driveId: string): MirrorEntry => ({ driveId, mimeType: 'application/vnd.google-apps.folder', isFolder: true, hydrated: true, pinned: true });

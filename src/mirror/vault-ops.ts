@@ -129,6 +129,19 @@ export class ObsidianVaultOps implements VaultOps {
     if (f) await this.vault.trash(f, false); // corbeille système d'Obsidian
   }
 
+  async rename(oldPath: string, newPath: string): Promise<void> {
+    const op = normalizePath(oldPath);
+    const np = normalizePath(newPath);
+    assertSafePath(op);
+    assertSafePath(np);
+    const f = this.vault.getAbstractFileByPath(op);
+    if (!f) return; // rien à renommer localement
+    // crée les dossiers parents de destination si besoin (déplacement vers un nouveau dossier)
+    const parent = np.split('/').slice(0, -1).join('/');
+    if (parent) await this.createFolder(parent);
+    await this.vault.rename(f, np);
+  }
+
   isEmptyFolder(path: string): boolean {
     // Dossiers dotés (rares hors .obsidian, déjà exclu) : non gérés par l'API Vault ;
     // au pire un dossier doté vide n'est pas élagué (fuite bénigne, jamais un crash).

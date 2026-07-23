@@ -15,6 +15,10 @@ export interface SyncSchedulerOptions {
   isSynced: (path: string) => boolean;
   isOnline: () => boolean;
   intervalMs?: number;
+  /** Balayage complet (renommages/déplacements/contenu de TOUS les fichiers synchronisés),
+   *  exécuté périodiquement — toutes les `fullScanEvery` itérations. */
+  fullScan?: () => Promise<void>;
+  fullScanEvery?: number;
   onError?: (err: unknown) => void;
 }
 
@@ -25,6 +29,7 @@ export interface SyncSchedulerOptions {
  *  Les autres notes sont rafraîchies à leur ouverture (pull-on-open). Pausé hors-ligne. */
 export class SyncScheduler {
   private running = false;
+  private ticks = 0;
   private timer?: ReturnType<typeof setInterval>;
 
   constructor(private opts: SyncSchedulerOptions) {}
@@ -36,6 +41,12 @@ export class SyncScheduler {
       await this.opts.push.flushPending(); // local → Drive (rattrapage hors-ligne)
       for (const path of this.opts.getOpenPaths()) {
         if (this.opts.isSynced(path)) await this.opts.pull.refreshFile(path);
+      }
+      // balayage complet : dès le 1er tick (établit le point de référence), puis périodiquement
+      this.ticks++;
+      const every = this.opts.fullScanEvery ?? 12;
+      if (this.opts.fullScan && (this.ticks === 1 || this.ticks % every === 0)) {
+        await this.opts.fullScan();
       }
     } catch (e) {
       this.opts.onError?.(e); // ex. bascule hors-ligne en plein tick — le tick suivant réessaie

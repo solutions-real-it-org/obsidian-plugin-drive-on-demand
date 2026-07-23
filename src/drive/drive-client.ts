@@ -78,6 +78,14 @@ export class DriveClient {
 
   /** Jeton de départ pour l'API Changes : point de référence « maintenant » (aucun
    *  changement antérieur). À obtenir une fois, puis à faire évoluer via listChanges. */
+  /** Id RÉEL du dossier racine du Drive (l'alias « root » ne correspond pas aux `parents`
+   *  renvoyés par l'API, qui donnent le vrai id) — nécessaire pour mapper un parent = racine. */
+  async getRootFolderId(): Promise<string> {
+    const res = await this.http({ url: `${API}/files/root?fields=id`, headers: await this.headers() });
+    if (res.status !== 200) throw new Error(`Drive root id ${res.status}: ${res.text}`);
+    return res.json<{ id: string }>().id;
+  }
+
   async getStartPageToken(): Promise<string> {
     const res = await this.http({ url: `${API}/changes/startPageToken`, headers: await this.headers() });
     if (res.status !== 200) throw new Error(`Drive startPageToken ${res.status}: ${res.text}`);
@@ -86,31 +94,36 @@ export class DriveClient {
 
   /** Liste les changements Drive depuis `pageToken` (efficace : un appel = tout ce qui a
    *  changé). Paginer via `nextPageToken` ; quand `newStartPageToken` apparaît, c'est le
-   *  jeton à conserver pour la prochaine vérification. `changed`/`removed` = fileId. */
+   *  jeton à conserver. Chaque changement porte fileId + (si non supprimé) le nom et les
+   *  parents ACTUELS du fichier → permet de détecter les renommages/déplacements. */
   async listChanges(pageToken: string): Promise<{
-    changed: string[];
-    removed: string[];
+    changes: { fileId: string; removed: boolean; name?: string; parents?: string[]; mimeType?: string }[];
     newStartPageToken?: string;
     nextPageToken?: string;
   }> {
-    const fields = 'newStartPageToken,nextPageToken,changes(fileId,removed,file(trashed))';
+    const fields = 'newStartPageToken,nextPageToken,changes(fileId,removed,file(name,parents,trashed,mimeType))';
     const url =
       `${API}/changes?pageToken=${encodeURIComponent(pageToken)}` +
       `&pageSize=200&fields=${encodeURIComponent(fields)}`;
     const res = await this.http({ url, headers: await this.headers() });
     if (res.status !== 200) throw new Error(`Drive changes ${res.status}: ${res.text}`);
     const j = res.json<{
-      changes?: { fileId: string; removed?: boolean; file?: { trashed?: boolean } }[];
+      changes?: {
+        fileId: string;
+        removed?: boolean;
+        file?: { name?: string; parents?: string[]; trashed?: boolean; mimeType?: string };
+      }[];
       newStartPageToken?: string;
       nextPageToken?: string;
     }>();
-    const changed: string[] = [];
-    const removed: string[] = [];
-    for (const c of j.changes ?? []) {
-      if (c.removed || c.file?.trashed) removed.push(c.fileId);
-      else changed.push(c.fileId);
-    }
-    return { changed, removed, newStartPageToken: j.newStartPageToken, nextPageToken: j.nextPageToken };
+    const changes = (j.changes ?? []).map((c) => ({
+      fileId: c.fileId,
+      removed: Boolean(c.removed || c.file?.trashed),
+      name: c.file?.name,
+      parents: c.file?.parents,
+      mimeType: c.file?.mimeType,
+    }));
+    return { changes, newStartPageToken: j.newStartPageToken, nextPageToken: j.nextPageToken };
   }
 
   async readText(fileId: string): Promise<string> {

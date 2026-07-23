@@ -1,0 +1,137 @@
+import type { MirrorIndex } from '../mirror/mirror-index';
+import type { SelectiveSyncState } from './selective-sync-state';
+import { reindexPaths } from '../mirror/reindex';
+import { isIgnored } from '../mirror/tree-mirror';
+import { toNfc } from '../util/nfc';
+import type { PersistAdapter } from '../auth/token-store';
+
+interface RemoteDrive {
+  getStartPageToken(): Promise<string>;
+  getRootFolderId(): Promise<string>;
+  listChanges(pageToken: string): Promise<{
+    changes: { fileId: string; removed: boolean; name?: string; parents?: string[]; mimeType?: string }[];
+    newStartPageToken?: string;
+    nextPageToken?: string;
+  }>;
+}
+interface RemotePull {
+  refreshFile(path: string): Promise<unknown>;
+}
+interface RemoteVault {
+  rename(oldPath: string, newPath: string): Promise<void>;
+}
+
+export interface RemoteChangeSyncOptions {
+  drive: RemoteDrive;
+  index: MirrorIndex;
+  state: SelectiveSyncState;
+  vault: RemoteVault;
+  pull: RemotePull;
+  /** Id Drive de la racine de travail (« root » ou id d'un dossier de travail). */
+  rootId: () => string;
+  adapter: PersistAdapter; // persiste le jeton de page des changements
+  onRename?: (oldPath: string, newPath: string) => void;
+}
+
+/** Balayage complet périodique : demande à Drive « qu'est-ce qui a changé ? » (API Changes)
+ *  et répercute en LOCAL, pour les fichiers/dossiers déjà synchronisés :
+ *   - renommé / déplacé sur Drive → renommé / déplacé en local (+ réindexation) ;
+ *   - contenu modifié → tiré.
+ *  Ne télécharge PAS les nouveaux fichiers Drive (sync reste sélective) et ne répercute PAS
+ *  les suppressions distantes (sécurité). Complète le rafraîchissement 5 s des notes ouvertes. */
+export class RemoteChangeSync {
+  private token: string | null = null;
+  private rootMappingId?: string;
+
+  constructor(private opts: RemoteChangeSyncOptions) {}
+
+  async load(): Promise<void> {
+    const d = await this.opts.adapter.load();
+    this.token = typeof d.changesToken === 'string' ? d.changesToken : null;
+  }
+
+  private async saveToken(tok: string): Promise<void> {
+    this.token = tok;
+    const d = await this.opts.adapter.load();
+    d.changesToken = tok;
+    await this.opts.adapter.save({ ...d });
+  }
+
+  /** L'alias « root » ne correspond pas aux `parents` de l'API : on résout l'id réel une fois. */
+  private async rootMapping(): Promise<string> {
+    if (this.rootMappingId === undefined) {
+      const rid = this.opts.rootId();
+      this.rootMappingId = rid === 'root' ? await this.opts.drive.getRootFolderId() : rid;
+    }
+    return this.rootMappingId;
+  }
+
+  async scan(): Promise<void> {
+    if (!this.token) {
+      // premier passage : point de référence « maintenant » (pas d'historique à rejouer)
+      await this.saveToken(await this.opts.drive.getStartPageToken());
+      return;
+    }
+    const rootMappingId = await this.rootMapping();
+
+    const changes: { fileId: string; removed: boolean; name?: string; parents?: string[] }[] = [];
+    let pageToken: string | undefined = this.token;
+    let newToken = this.token;
+    while (pageToken) {
+      const r = await this.opts.drive.listChanges(pageToken);
+      changes.push(...r.changes);
+      if (r.nextPageToken) pageToken = r.nextPageToken;
+      else {
+        newToken = r.newStartPageToken ?? newToken;
+        pageToken = undefined;
+      }
+    }
+
+    const byId = new Map<string, string>(); // driveId → chemin local (fichiers ET dossiers)
+    for (const p of this.opts.index.paths()) {
+      const e = this.opts.index.get(p);
+      if (e) byId.set(e.driveId, p);
+    }
+
+    for (const c of changes) {
+      const curPath = byId.get(c.fileId);
+      if (!curPath) continue; // pas suivi (nouveau fichier / non synchronisé) → ignoré
+      if (c.removed) continue; // suppression distante → non répercutée (sécurité)
+      const entry = this.opts.index.get(curPath);
+      if (!entry) continue;
+
+      const newPath = this.computeNewPath(curPath, c, rootMappingId, byId);
+      if (newPath !== curPath && !isIgnored(newPath)) {
+        await this.opts.vault.rename(curPath, newPath); // renommé/déplacé sur Drive → en local
+        await reindexPaths(this.opts.index, this.opts.state, curPath, newPath);
+        this.opts.onRename?.(curPath, newPath);
+        if (!entry.isFolder) await this.opts.pull.refreshFile(newPath);
+      } else if (!entry.isFolder) {
+        await this.opts.pull.refreshFile(curPath); // contenu éventuellement modifié
+      }
+    }
+
+    if (newToken !== this.token) await this.saveToken(newToken);
+  }
+
+  /** Chemin local attendu d'après le nom + parent Drive actuels du fichier changé. */
+  private computeNewPath(
+    curPath: string,
+    c: { name?: string; parents?: string[] },
+    rootMappingId: string,
+    byId: Map<string, string>,
+  ): string {
+    const newName = c.name ? toNfc(c.name) : undefined;
+    if (!newName) return curPath;
+    const parentId = c.parents?.[0];
+    let parentPath: string | undefined;
+    if (parentId === rootMappingId) parentPath = '';
+    else if (parentId) parentPath = byId.get(parentId); // dossier suivi
+    if (parentPath === undefined) {
+      // parent Drive inconnu (déplacé hors zone suivie) : on applique juste le nom, même dossier
+      const dir = curPath.split('/').slice(0, -1).join('/');
+      return dir ? `${dir}/${newName}` : newName;
+    }
+    return parentPath ? `${parentPath}/${newName}` : newName;
+  }
+}

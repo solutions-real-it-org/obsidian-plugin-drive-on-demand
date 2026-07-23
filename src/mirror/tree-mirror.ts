@@ -10,6 +10,8 @@ export interface VaultOps {
   readText(path: string): Promise<string>;
   readBinary(path: string): Promise<ArrayBuffer>;
   remove(path: string): Promise<void>;
+  /** Renomme/déplace un fichier ou dossier local (répercute un renommage/déplacement Drive). */
+  rename(oldPath: string, newPath: string): Promise<void>;
   isEmptyFolder(path: string): boolean;
   /** Enfants locaux immédiats d'un dossier du vault (`''` = racine). Synchrone (index
    *  Obsidian en mémoire). Sert à repérer les fichiers présents en local mais pas sur Drive. */

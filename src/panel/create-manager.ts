@@ -7,6 +7,7 @@ import { hashContent } from '../util/content-hash';
 import { isFolder as isDriveFolder } from '../drive/drive-client';
 import { guessMimeType } from '../util/mime';
 import { toNfc } from '../util/nfc';
+import { reindexPaths } from '../mirror/reindex';
 
 export type CreateResult = 'created' | 'skipped';
 
@@ -107,21 +108,8 @@ export class CreateManager {
     }
   }
 
-  /** Déplace les clés index/état de `oldPath` (et descendants) vers `newPath`. */
   private async reindex(oldPath: string, newPath: string): Promise<void> {
-    const affected = this.opts.index.paths().filter((p) => p === oldPath || p.startsWith(oldPath + '/'));
-    for (const p of affected) {
-      const entry = this.opts.index.get(p);
-      if (!entry) continue;
-      const np = newPath + p.slice(oldPath.length);
-      const wasSynced = this.opts.state.isSynced(p);
-      await this.opts.index.delete(p);
-      await this.opts.index.set(np, entry);
-      if (wasSynced) {
-        await this.opts.state.setFileSynced(p, false);
-        await this.opts.state.setFileSynced(np, true);
-      }
-    }
+    await reindexPaths(this.opts.index, this.opts.state, oldPath, newPath);
   }
 
   private async processRename(oldPath: string, newPath: string, isFolder: boolean): Promise<CreateResult> {

@@ -16,6 +16,7 @@ import { SelectiveSyncState } from './panel/selective-sync-state';
 import { WorkingRootStore } from './panel/working-root';
 import { OutboxStore } from './panel/outbox';
 import { SyncScheduler } from './panel/sync-scheduler';
+import { RemoteChangeSync } from './panel/remote-change-sync';
 import { toNfc } from './util/nfc';
 import { SyncEngine } from './panel/sync-engine';
 import { PushManager } from './panel/push-manager';
@@ -132,12 +133,24 @@ export default class GoogleDriveFodPlugin extends Plugin {
       });
       return [...set];
     };
+    // Balayage complet (~60 s) : répercute en local les renommages / déplacements / contenu
+    // faits sur Drive pour TOUS les fichiers synchronisés (pas seulement les notes ouvertes).
+    const remoteSync = new RemoteChangeSync({
+      drive: this.drive, index: this.index, state: syncState, vault: vaultOps, pull,
+      rootId: () => workingRoot.rootId(),
+      adapter: keyedAdapter(this.data, 'scheduler'),
+      onRename: (o, n) => console.log('[gdrive-fod] renommage distant', o, '→', n),
+    });
+    await remoteSync.load();
+
     const scheduler = new SyncScheduler({
       pull, push,
       getOpenPaths,
       isSynced: (p) => syncState.isSynced(p),
       isOnline: () => online,
       intervalMs: 5000,
+      fullScan: () => remoteSync.scan(),
+      fullScanEvery: 12, // ~60 s
       onError: (e) => console.error('[gdrive-fod] tick de synchronisation', e),
     });
     this.register(() => scheduler.dispose());

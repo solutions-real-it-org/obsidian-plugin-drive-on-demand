@@ -15,7 +15,7 @@ function driveObj() {
 }
 function vaultObj(local: string) {
   const writes: Array<{ path: string; content: string }> = [];
-  const vault: VaultOps = { exists: async () => true, createFolder: async () => {}, createStub: async () => {}, writeText: async (p, d) => { writes.push({ path: p, content: d }); }, writeBinary: async () => {}, readText: async () => local, readBinary: async () => new ArrayBuffer(0), remove: async () => {}, isEmptyFolder: () => false, listChildren: () => [] };
+  const vault: VaultOps = { exists: async () => true, createFolder: async () => {}, createStub: async () => {}, writeText: async (p, d) => { writes.push({ path: p, content: d }); }, writeBinary: async () => {}, readText: async () => local, readBinary: async () => new ArrayBuffer(0), remove: async () => {}, isEmptyFolder: () => false, rename: async () => {}, listChildren: () => [] };
   return { vault, writes };
 }
 const ENTRY = (o: Partial<MirrorEntry> = {}): MirrorEntry => ({ driveId: 'D', mimeType: 'text/markdown', isFolder: false, hydrated: true, pinned: true, ...o });

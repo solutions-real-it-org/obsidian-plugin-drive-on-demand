@@ -1,0 +1,111 @@
+import { describe, it, expect, vi } from 'vitest';
+import { RemoteChangeSync, type RemoteChangeSyncOptions } from './remote-change-sync';
+import { MirrorIndex, type MirrorEntry } from '../mirror/mirror-index';
+import { SelectiveSyncState } from './selective-sync-state';
+import type { PersistAdapter } from '../auth/token-store';
+
+function ad() {
+  const raw: Record<string, unknown> = {};
+  const a: PersistAdapter = { async load() { return raw; }, async save(d) { Object.keys(raw).forEach((k) => delete raw[k]); Object.assign(raw, d); } };
+  return { a, raw };
+}
+const fileEntry = (driveId: string): MirrorEntry => ({ driveId, mimeType: 'text/markdown', isFolder: false, hydrated: true, pinned: true });
+const folderEntry = (driveId: string): MirrorEntry => ({ driveId, mimeType: 'application/vnd.google-apps.folder', isFolder: true, hydrated: true, pinned: true });
+
+type Change = { fileId: string; removed: boolean; name?: string; parents?: string[] };
+function makeDrive(changes: Change[], rootId = 'REALROOT') {
+  return {
+    getStartPageToken: vi.fn(async () => 'START'),
+    getRootFolderId: vi.fn(async () => rootId),
+    listChanges: vi.fn(async () => ({ changes, newStartPageToken: 'NEXT' })),
+  };
+}
+
+async function setup(changes: Change[], seed: (i: MirrorIndex, s: SelectiveSyncState) => Promise<void>, token = 'CUR') {
+  const index = new MirrorIndex(ad().a); await index.load();
+  const state = new SelectiveSyncState(ad().a); await state.load();
+  await seed(index, state);
+  const vault = { rename: vi.fn(async () => {}) };
+  const pull = { refreshFile: vi.fn(async () => 'pulled') };
+  const { a, raw } = ad();
+  raw.changesToken = token;
+  const drive = makeDrive(changes);
+  const opts: RemoteChangeSyncOptions = {
+    drive, index, state, vault, pull, rootId: () => 'root', adapter: a,
+  };
+  const rcs = new RemoteChangeSync(opts);
+  await rcs.load();
+  return { rcs, index, state, vault, pull, drive, raw };
+}
+
+describe('RemoteChangeSync', () => {
+  it('premier passage (sans jeton) : établit le point de référence, ne touche à rien', async () => {
+    const index = new MirrorIndex(ad().a); await index.load();
+    const state = new SelectiveSyncState(ad().a); await state.load();
+    const vault = { rename: vi.fn(async () => {}) };
+    const pull = { refreshFile: vi.fn(async () => 'x') };
+    const { a, raw } = ad();
+    const drive = makeDrive([]);
+    const rcs = new RemoteChangeSync({ drive, index, state, vault, pull, rootId: () => 'root', adapter: a });
+    await rcs.load();
+    await rcs.scan();
+    expect(drive.getStartPageToken).toHaveBeenCalledTimes(1);
+    expect(drive.listChanges).not.toHaveBeenCalled();
+    expect(raw.changesToken).toBe('START');
+  });
+
+  it('renommage sur Drive (même dossier suivi) → renomme en local + réindexe + tire le contenu', async () => {
+    const { rcs, index, state, vault, pull, raw } = await setup(
+      [{ fileId: 'FILE', removed: false, name: 'nouveau.md', parents: ['DIR'] }],
+      async (i, s) => { await i.set('dir', folderEntry('DIR')); await i.set('dir/ancien.md', fileEntry('FILE')); await s.setFileSynced('dir/ancien.md', true); },
+    );
+    await rcs.scan();
+    expect(vault.rename).toHaveBeenCalledWith('dir/ancien.md', 'dir/nouveau.md');
+    expect(index.get('dir/ancien.md')).toBeUndefined();
+    expect(index.get('dir/nouveau.md')?.driveId).toBe('FILE');
+    expect(state.isSynced('dir/nouveau.md')).toBe(true);
+    expect(pull.refreshFile).toHaveBeenCalledWith('dir/nouveau.md');
+    expect(raw.changesToken).toBe('NEXT');
+  });
+
+  it('renommage à la RACINE (parent = id racine réel) → utilise getRootFolderId', async () => {
+    const { rcs, vault, index } = await setup(
+      [{ fileId: 'FILE', removed: false, name: 'renommee.md', parents: ['REALROOT'] }],
+      async (i, s) => { await i.set('note.md', fileEntry('FILE')); await s.setFileSynced('note.md', true); },
+    );
+    await rcs.scan();
+    expect(vault.rename).toHaveBeenCalledWith('note.md', 'renommee.md');
+    expect(index.get('renommee.md')?.driveId).toBe('FILE');
+  });
+
+  it('contenu modifié (même nom/dossier) → pas de renommage, tire le contenu', async () => {
+    const { rcs, vault, pull } = await setup(
+      [{ fileId: 'FILE', removed: false, name: 'note.md', parents: ['DIR'] }],
+      async (i, s) => { await i.set('dir', folderEntry('DIR')); await i.set('dir/note.md', fileEntry('FILE')); await s.setFileSynced('dir/note.md', true); },
+    );
+    await rcs.scan();
+    expect(vault.rename).not.toHaveBeenCalled();
+    expect(pull.refreshFile).toHaveBeenCalledWith('dir/note.md');
+  });
+
+  it('suppression distante → non répercutée (ni renommage ni tir)', async () => {
+    const { rcs, vault, pull, index } = await setup(
+      [{ fileId: 'FILE', removed: true }],
+      async (i, s) => { await i.set('dir/note.md', fileEntry('FILE')); await s.setFileSynced('dir/note.md', true); },
+    );
+    await rcs.scan();
+    expect(vault.rename).not.toHaveBeenCalled();
+    expect(pull.refreshFile).not.toHaveBeenCalled();
+    expect(index.get('dir/note.md')?.driveId).toBe('FILE'); // toujours suivi
+  });
+
+  it('changement d un fichier NON suivi (nouveau sur Drive) → ignoré (pas de download auto)', async () => {
+    const { rcs, vault, pull } = await setup(
+      [{ fileId: 'INCONNU', removed: false, name: 'x.md', parents: ['DIR'] }],
+      async (i) => { await i.set('dir', folderEntry('DIR')); },
+    );
+    await rcs.scan();
+    expect(vault.rename).not.toHaveBeenCalled();
+    expect(pull.refreshFile).not.toHaveBeenCalled();
+  });
+});
